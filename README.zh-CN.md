@@ -10,6 +10,18 @@
 
 ---
 
+## 截图
+
+**悬浮条** — 默认只显示问题，悬停 / 快捷键显示答案：
+
+<img src="docs/screenshots/overlay.png" alt="摸鱼复习条：问题与答案" width="640">
+
+**设置** — 外观、字体与快捷键：
+
+<img src="docs/screenshots/settings.png" alt="摸鱼复习条设置" width="360">
+
+---
+
 ## 功能
 
 | | |
@@ -155,6 +167,7 @@ moyu-anki-overlay/
 ├── config.md
 ├── manifest.json
 ├── pack-ankiaddon.sh      # 打包 .ankiaddon 用于 AnkiWeb
+├── docs/screenshots/      # README 截图
 ├── README.md
 └── README.zh-CN.md
 ```

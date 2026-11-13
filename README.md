@@ -10,6 +10,18 @@ By default only the **question** is shown. Hover or press a shortcut to reveal t
 
 ---
 
+## Screenshots
+
+**Overlay** — question only, then hover / shortcut to reveal the answer:
+
+<img src="docs/screenshots/overlay.png" alt="Moyu overlay: question then answer" width="640">
+
+**Settings** — appearance, fonts, and shortcuts:
+
+<img src="docs/screenshots/settings.png" alt="Moyu overlay settings" width="360">
+
+---
+
 ## Features
 
 | | |
@@ -155,6 +167,7 @@ moyu-anki-overlay/
 ├── config.md
 ├── manifest.json
 ├── pack-ankiaddon.sh      # build .ankiaddon for AnkiWeb
+├── docs/screenshots/      # README screenshots
 ├── README.md
 └── README.zh-CN.md
 ```

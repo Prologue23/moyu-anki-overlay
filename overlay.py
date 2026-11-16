@@ -163,6 +163,10 @@ class MoyuOverlay(QWidget):
         self._drag_moved = False
         self._press_card = None
         self._press_can_grade = False
+        self._press_count = 0
+        self._press_focus_only = False
+        self._press_anchor = QPoint()
+        self._refocus_click_required = False
         self._pending_click = None
         self._click_timer = QTimer(self)
         self._click_timer.setSingleShot(True)
@@ -208,6 +212,7 @@ class MoyuOverlay(QWidget):
         self.refresh()
 
     def apply_config(self, config: dict) -> None:
+        self._cancel_pending_click()
         self.config = merge_config(config)
         self._opacity = float(self.config.get("opacity", 1.0))
         self.setWindowOpacity(self._opacity)
@@ -451,9 +456,10 @@ class MoyuOverlay(QWidget):
         name = str(sc.get("reveal_grade") or "good").lower()
         return {"again": 1, "hard": 2, "good": 3, "easy": 4}.get(name, 3)
 
-    def _click_grade_ease(self) -> int:
-        name = str(self.config.get("click_grade") or "good").lower()
-        return {"again": 1, "hard": 2, "good": 3, "easy": 4}.get(name, 3)
+    def _click_action(self, count: int) -> str:
+        key, default = {1: ("click_grade", "good"), 2: ("double_click_action", "hide"),
+                        3: ("triple_click_action", "again")}[min(count, 3)]
+        return str(self.config.get(key) or default).lower()
 
     def _cancel_pending_click(self) -> None:
         self._click_timer.stop()
@@ -461,13 +467,62 @@ class MoyuOverlay(QWidget):
 
     def _commit_click_grade(self) -> None:
         pending = self._pending_click
-        self._pending_click = None
+        self._cancel_pending_click()
         if pending is None:
             return
-        card, markup, ease = pending
-        if (self.isVisible() and self.controller.active and self._loaded and
-                not self._dragging and not self._resizing and self.controller.card is card and self._document == markup):
-            self._on_grade(ease)
+        card, markup, count, can_grade, focus_only, anchor = pending
+        if (not self.isVisible() or not self.controller.active or
+                self._dragging or self._resizing or self.controller.card is not card or
+                self._document != markup):
+            return
+        # An activation click must never execute its configured action. Explicit
+        # double/triple gestures remain available after returning to the overlay.
+        if count == 1 and focus_only:
+            return
+        action = self._click_action(count)
+        ease = {"again": 1, "hard": 2, "good": 3, "easy": 4}.get(action)
+        if ease:
+            if can_grade and self._loaded:
+                self._on_grade(ease)
+        elif action == "hide":
+            self._quick_hide()
+        elif action == "undo":
+            self._undo_answer()
+        elif action == "focus":
+            self._focus_and_reveal()
+
+    def _focus_and_reveal(self) -> None:
+        self._keyboard_session = True
+        if not self.isActiveWindow():
+            self.activateWindow()
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if self.controller.card is not None:
+            self._await_mouse_leave = False
+            self._pinned_reveal = True
+            self._relayout()
+
+    def _undo_allowed(self) -> bool:
+        return bool(self.isVisible() and self.controller.active and
+                    not self._typing_in_field() and
+                    (self.isActiveWindow() or self._cursor_over_self()))
+
+    def _undo_answer(self) -> None:
+        # If the click has not been submitted, simply cancel it; never undo
+        # a previous card while the accidental click is still pending.
+        if self._pending_click is not None or self._dragging:
+            self._cancel_pending_click()
+            self._cancel_drag()
+            self._press_card = None
+            self._focus_and_reveal()
+            return
+        if self.controller.undo_last_answer():
+            self._refocus_click_required = False
+            self._keyboard_session = True
+            self._await_mouse_leave = False
+            self._hovered = False
+            self._pinned_reveal = True
+            self.refresh()
+            self._focus_and_reveal()
 
     def _grade_map(self) -> dict[str, int]:
         sc = self.config.get("shortcuts") or {}
@@ -536,6 +591,7 @@ class MoyuOverlay(QWidget):
         if not reveal_key and not ease:
             return False
         self._cancel_pending_click()
+        self._refocus_click_required = False
         self._keyboard_session = True
         self._keep_keyboard_focus()
         # The leave/re-enter guard applies only to automatic mouse reveal.
@@ -567,16 +623,33 @@ class MoyuOverlay(QWidget):
         if not ok and self.controller.card is None:
             self.refresh()
 
-    def _begin_drag(self, global_pos: QPoint) -> None:
-        self._cancel_pending_click()
+    def _begin_drag(self, global_pos: QPoint, double_click: bool = False) -> None:
+        pending = self._pending_click
+        continuing = bool(pending and self._click_timer.isActive() and
+                          pending[0] is self.controller.card and pending[1] == self._document and
+                          (global_pos - pending[5]).manhattanLength() <= QApplication.startDragDistance())
+        if continuing:
+            self._click_timer.stop()
+            _, _, count, can_grade, focus_only, anchor = pending
+            self._press_count = min(count + 1, 3)
+            self._press_can_grade = can_grade
+            self._press_focus_only = focus_only
+            self._press_anchor = anchor
+        else:
+            self._cancel_pending_click()
+            self._press_count = 2 if double_click else 1
+            self._press_can_grade = bool(self.controller.active and self._expanded() and self._loaded and self._rendered_expanded)
+            self._press_focus_only = self._refocus_click_required or not self.isActiveWindow() or not self._anki_active()
+            self._press_anchor = QPoint(global_pos)
         self._press_card = self.controller.card
-        self._press_can_grade = bool(self.controller.active and self._expanded() and self._loaded and self._rendered_expanded)
         self._drag_moved = False
         self._dragging = True
         self._drag_start_position = self.pos()
         self._drag_offset = global_pos - self.pos()
+        self._keyboard_session = True
+        if not self.isActiveWindow():
+            self.activateWindow()
         self.setFocus(Qt.FocusReason.MouseFocusReason)
-        # Receive release even when the mouse leaves the visible capsule.
         self.grabMouse()
 
     def _continue_drag(self, global_pos: QPoint) -> None:
@@ -584,6 +657,7 @@ class MoyuOverlay(QWidget):
             target = global_pos - self._drag_offset
             if target != self.pos():
                 self._drag_moved = True
+                self._cancel_pending_click()
                 self.move(target)
 
     def _cancel_drag(self) -> None:
@@ -597,20 +671,20 @@ class MoyuOverlay(QWidget):
         moved = self._drag_moved or self.pos() != self._drag_start_position
         self._cancel_drag()
         if moved:
+            self._cancel_pending_click()
             self._save_geometry()
         elif self.controller.card is self._press_card and self.controller.active:
-            if self._press_can_grade:
-                self._pending_click = (self._press_card, self._document, self._click_grade_ease())
-                # Wait for the OS double-click window before scoring. Otherwise
-                # the first half of a double-click would already grade a card.
+            self._refocus_click_required = False
+            self._pending_click = (self._press_card, self._document, self._press_count,
+                                   self._press_can_grade, self._press_focus_only, self._press_anchor)
+            # Defer single AND double actions so a third click can supersede
+            # them. A triple executes once on release; no intermediate grading.
+            if self._press_count >= 3:
+                self._commit_click_grade()
+            else:
                 self._click_timer.start(QApplication.doubleClickInterval() + 20)
-            elif self.controller.card is not None:
-                # After grading, a click can reveal the next question without
-                # requiring a mouse leave/re-enter; it never scores it unseen.
-                self._await_mouse_leave = False
-                self._pinned_reveal = True
-                self._grab_keys()
-                self._relayout()
+            if not self._press_can_grade and self.controller.card is not None:
+                self._focus_and_reveal()
         self._press_card = None
         self._press_can_grade = False
         self._queue_measure()
@@ -624,6 +698,14 @@ class MoyuOverlay(QWidget):
 
     def eventFilter(self, obj, event):  # noqa: N802
         et = event.type()
+        if et in (QEvent.Type.WindowDeactivate, QEvent.Type.ApplicationDeactivate) and (obj is self or obj is QApplication.instance()):
+            self._refocus_click_required = True
+            self._cancel_pending_click()
+        if et in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress) and self._undo_allowed() and event.matches(QKeySequence.StandardKey.Undo):
+            if et == QEvent.Type.KeyPress and not event.isAutoRepeat():
+                self._undo_answer()
+            event.accept()
+            return True
         # Chromium delivers mouse input to an internal child, not the
         # QWebEngineView itself. Filtering the application covers that child
         # and replacements created after page loads.
@@ -633,9 +715,10 @@ class MoyuOverlay(QWidget):
             if et == QEvent.Type.Wheel:
                 self._cancel_pending_click()
             if et == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
-                self._quick_hide()
-                event.accept()
-                return True
+                if obj not in (self._left_handle, self._right_handle) and not self._resizing:
+                    self._begin_drag(event.globalPosition().toPoint(), double_click=True)
+                    event.accept()
+                    return True
             resize_target = obj in (self._left_handle, self._right_handle) or self._resizing
             if not resize_target:
                 if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -694,7 +777,7 @@ class MoyuOverlay(QWidget):
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self._quick_hide()
+            self._begin_drag(event.globalPosition().toPoint(), double_click=True)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)

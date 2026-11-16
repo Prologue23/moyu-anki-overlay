@@ -16,5 +16,7 @@
     "reveal_grade": "good"
   },
   "card_width": 330,
-  "click_grade": "good"
+  "click_grade": "good",
+  "double_click_action": "hide",
+  "triple_click_action": "again"
 }

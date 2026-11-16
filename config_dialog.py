@@ -279,6 +279,8 @@ def _defaults() -> dict:
         "capsule_style_version": 1,
         "toggle_shortcut": "Ctrl+Shift+M",
         "click_grade": "good",
+        "double_click_action": "hide",
+        "triple_click_action": "again",
         "shortcuts": {
             "again": "1",
             "hard": "2",
@@ -510,17 +512,28 @@ class MoyuConfigDialog(QDialog):
         body.addWidget(reveal)
         body.addSpacing(10)
 
-        # Pointer grading is independent of the reveal-key grade setting.
         body.addWidget(_section("触摸板 / 鼠标"))
         pointer = _Group()
-        self.click_grade = QComboBox()
-        for key, label in _GRADE_OPTIONS:
-            self.click_grade.addItem(label, key)
-        idx = self.click_grade.findData(self._conf.get("click_grade", "good"))
-        self.click_grade.setCurrentIndex(idx if idx >= 0 else 2)
-        _style_capsule(self.click_grade)
-        pointer.add_row(_row("单击评分", self.click_grade, "答案显示后单击；双击隐藏，拖动不评分"))
+        options = (*_GRADE_OPTIONS, ("hide", "隐藏浮条"), ("undo", "撤销上次评分"),
+                   ("focus", "仅聚焦 / 显示答案"), ("none", "不执行动作"))
+        for attr, key, label, default in (
+            ("click_grade", "click_grade", "单击动作", "good"),
+            ("double_click_action", "double_click_action", "双击动作", "hide"),
+            ("triple_click_action", "triple_click_action", "三击动作", "again"),
+        ):
+            combo = QComboBox()
+            for value, text in options:
+                combo.addItem(text, value)
+            idx = combo.findData(self._conf.get(key, default))
+            combo.setCurrentIndex(idx if idx >= 0 else combo.findData(default))
+            _style_capsule(combo)
+            setattr(self, attr, combo)
+            pointer.add_row(_row(label, combo, "评分需答案已显示；恢复焦点的单击不评分"))
         body.addWidget(pointer)
+        hint = QLabel("⌘Z（Windows：Ctrl+Z）撤销上次评分；连击判定结束后执行动作。")
+        hint.setWordWrap(True)
+        hint.setObjectName("RowHint")
+        body.addWidget(hint)
         body.addSpacing(10)
 
         # Grade
@@ -577,7 +590,9 @@ class MoyuConfigDialog(QDialog):
         rg = str(sc.get("reveal_grade") or "good")
         idx = self.reveal_grade.findData(rg)
         self.reveal_grade.setCurrentIndex(idx if idx >= 0 else 2)
-        self.click_grade.setCurrentIndex(2)
+        self.click_grade.setCurrentIndex(self.click_grade.findData("good"))
+        self.double_click_action.setCurrentIndex(self.double_click_action.findData("hide"))
+        self.triple_click_action.setCurrentIndex(self.triple_click_action.findData("again"))
         self.key_again.setKeySequence(QKeySequence(sc["again"]))
         self.key_hard.setKeySequence(QKeySequence(sc["hard"]))
         self.key_good.setKeySequence(QKeySequence(sc["good"]))
@@ -590,6 +605,8 @@ class MoyuConfigDialog(QDialog):
     def _save(self) -> None:
         conf = merge_config(self._conf)
         conf["click_grade"] = self.click_grade.currentData() or "good"
+        conf["double_click_action"] = self.double_click_action.currentData() or "hide"
+        conf["triple_click_action"] = self.triple_click_action.currentData() or "again"
         conf["opacity"] = float(self.opacity.value())
         conf["card_width"] = int(self.max_width.value())
         conf["auto_show"] = bool(self.auto_show.isChecked())

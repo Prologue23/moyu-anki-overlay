@@ -148,6 +148,7 @@ class ReviewController:
     def __init__(self) -> None:
         self.card = None
         self.active = False
+        self._last_answer = None
 
     def can_start(self) -> bool:
         if not mw or not mw.col:
@@ -173,8 +174,8 @@ class ReviewController:
             return False
 
         try:
-            did = mw.col.decks.get_current_id()
-            mw.col.decks.select(did)
+            # The scheduler already follows the selected deck. Re-selecting
+            # it creates an undo step on current Anki and masks our review.
             self.card = mw.col.sched.getCard()
         except Exception:
             self.card = None
@@ -232,8 +233,14 @@ class ReviewController:
             return False
 
         did = mw.col.decks.get_current_id()
-        mw.col.decks.select(did)
-        mw.col.sched.answerCard(self.card, ease)
+        col = mw.col
+        card_id = self.card.id
+        before = self._undo_step(col)
+        self._last_answer = None
+        col.sched.answerCard(self.card, ease)
+        after = self._undo_step(col)
+        if after is not None and after != before:
+            self._last_answer = (col, after, card_id, did)
 
         if mw.state == "deckBrowser" and getattr(mw, "deckBrowser", None):
             try:
@@ -242,6 +249,54 @@ class ReviewController:
                 pass
 
         return self.load_next()
+
+    @staticmethod
+    def _undo_step(col):
+        try:
+            status = col.undo_status()
+            return status.last_step if status.undo else None
+        except Exception:
+            return None
+
+    def undo_last_answer(self) -> bool:
+        """Undo only our own most recent review, using Anki's native history."""
+        entry = self._last_answer
+        if not self.active or not entry or not mw or not mw.col:
+            tooltip("没有可撤销的摸鱼条评分。")
+            return False
+        col, step, card_id, deck_id = entry
+        if (mw.col is not col or mw.state == "review" or
+                self._undo_step(col) != step or
+                col.decks.get_current_id() != deck_id):
+            self._last_answer = None
+            tooltip("Anki 已有其他操作，未撤销，以免影响其他修改。")
+            return False
+        try:
+            col.undo()
+        except Exception:
+            tooltip("暂时无法撤销这次评分。")
+            return False
+        # Never retry the same history entry, even if reloading the card fails.
+        self._last_answer = None
+        try:
+            self.card = col.get_card(card_id)
+            if hasattr(self.card, "start_timer"):
+                self.card.start_timer()
+            elif hasattr(self.card, "startTimer"):
+                self.card.startTimer()
+        except Exception:
+            self.load_next()
+            tooltip("评分已撤销，但原卡片未能重新加载。")
+            return False
+        if mw.state == "deckBrowser" and getattr(mw, "deckBrowser", None):
+            try:
+                mw.deckBrowser.refresh()
+            except Exception:
+                pass
+        update = getattr(mw, "update_undo_actions", None)
+        if callable(update):
+            update()
+        return True
 
     def next_intervals(self) -> dict[int, str]:
         result = {1: "", 2: "", 3: "", 4: ""}

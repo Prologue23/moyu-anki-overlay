@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
-"""Frameless always-on-top pill bar for stealth Anki review."""
+"""Resizable desktop card, preserving Anki template markup and typography."""
 
 from __future__ import annotations
 
 from typing import Callable, Optional
 
+from aqt import mw
+
 from aqt.qt import (
     QApplication,
     QColor,
     QEvent,
-    QFont,
-    QHBoxLayout,
+    QUrl,
+    QRegion,
+    QRect,
+    QWebEngineView,
+    QWebEnginePage,
     QKeySequence,
     QLabel,
     QLineEdit,
     QPainter,
     QPlainTextEdit,
     QPoint,
-    QSizePolicy,
     QTextEdit,
     QTimer,
     Qt,
@@ -28,13 +32,7 @@ from aqt.qt import (
 
 from .config_dialog import merge_config
 from .review_controller import ReviewController
-
-
-def _truncate(text: str, max_chars: int) -> str:
-    text = (text or "").replace("\n", " ").strip()
-    if max_chars > 0 and len(text) > max_chars:
-        return text[: max_chars - 1] + "…"
-    return text
+from .rich_card import document
 
 
 def _normalize_key_name(name: str) -> str:
@@ -54,6 +52,9 @@ def _normalize_key_name(name: str) -> str:
 
 def _key_from_event(event) -> str:
     k = event.key()
+    if event.modifiers() & (Qt.KeyboardModifier.ControlModifier |
+                            Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier):
+        return QKeySequence(event.keyCombination()).toString(QKeySequence.SequenceFormat.PortableText)
     if k == Qt.Key.Key_Space:
         return "Space"
     if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -69,6 +70,71 @@ def _key_from_event(event) -> str:
     except Exception:
         text = QKeySequence(k).toString(QKeySequence.SequenceFormat.PortableText)
     return _normalize_key_name(text)
+
+
+class _CardPage(QWebEnginePage):
+    def acceptNavigationRequest(self, url, kind, is_main_frame):  # noqa: N802
+        # No Anki reviewer bridge and no navigation away from the card.
+        if kind == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            return False
+        return super().acceptNavigationRequest(url, kind, is_main_frame)
+
+
+class _MoveHandle(QLabel):
+    def __init__(self, owner):
+        super().__init__("", owner)
+        self.owner = owner
+        self.setFixedHeight(6)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setToolTip("按住任意文字区域拖动；双击隐藏；两侧调整宽度")
+
+    def paintEvent(self, event):
+        pass  # Invisible drag strip; no permanent toolbar.
+
+    def mousePressEvent(self, event):
+        self.owner.mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self.owner.mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.owner.mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.owner.mouseDoubleClickEvent(event)
+
+
+class _WidthHandle(QWidget):
+    def __init__(self, owner, side):
+        super().__init__(owner)
+        self.owner, self.side = owner, side
+        self.origin = None
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setToolTip("左右拖动调整卡片宽度")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.owner._cancel_pending_click()
+            self.origin = (event.globalPosition().x(), self.owner.x(), self.owner.width())
+            self.owner._resizing = True
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.origin is not None:
+            start, x, width = self.origin
+            delta = round(event.globalPosition().x() - start)
+            target = self.owner._clamp_width(width + (delta if self.side == 'right' else -delta))
+            if self.side == 'left':
+                self.owner.move(x + width - target, self.owner.y())
+            self.owner._set_card_width(target)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self.origin is not None:
+            self.origin = None
+            self.owner._resizing = False
+            self.owner._save_geometry()
+            event.accept()
 
 
 class MoyuOverlay(QWidget):
@@ -91,10 +157,20 @@ class MoyuOverlay(QWidget):
         # After grading: stay collapsed until mouse leaves, then hover works again.
         self._await_mouse_leave = False
         self._dragging = False
+        self._resizing = False
         self._drag_offset = QPoint()
-        self._opacity = float(self.config.get("opacity", 0.88))
+        self._drag_start_position = QPoint()
+        self._drag_moved = False
+        self._press_card = None
+        self._press_can_grade = False
+        self._pending_click = None
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._commit_click_grade)
+        self._opacity = float(self.config.get("opacity", 1.0))
         self._filter_installed = False
         self._keyboard_grabbed = False
+        self._keyboard_session = False
 
         self.setObjectName("MoyuOverlay")
         self.setWindowFlags(
@@ -111,9 +187,20 @@ class MoyuOverlay(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
+        self._loaded = False
+        self._rendered_expanded = False
+        self._document = ""
+        self._measure_serial = 0
+        self._last_expanded = None
+        self._visible_height = 50
+        self._card_width = self._clamp_width(int(self.config.get("card_width", 330)))
+        self._measure_timer = QTimer(self)
+        self._measure_timer.setSingleShot(True)
+        self._measure_timer.setInterval(45)
+        self._measure_timer.timeout.connect(self._measure_content)
         self._build_ui()
         self._apply_geometry_defaults()
-        self._apply_typography()
+        self.setWindowOpacity(self._opacity)
 
         self._hover_timer = QTimer(self)
         self._hover_timer.setInterval(40)
@@ -122,76 +209,87 @@ class MoyuOverlay(QWidget):
 
     def apply_config(self, config: dict) -> None:
         self.config = merge_config(config)
-        self._opacity = float(self.config.get("opacity", 0.88))
-        self._apply_typography()
+        self._opacity = float(self.config.get("opacity", 1.0))
+        self.setWindowOpacity(self._opacity)
+        self._set_card_width(int(self.config.get("card_width", 330)))
         self.refresh()
-
-    def _chip_style(self) -> str:
-        family = str(self.config.get("font_family") or "PingFang SC")
-        size = int(self.config.get("font_size") or 13)
-        return f"""
-        QLabel#contentChip {{
-            color: #1c1c1e;
-            background: rgba(255, 255, 255, 235);
-            border-radius: 11px;
-            padding: 5px 12px;
-            font-family: "{family}";
-            font-size: {size}px;
-        }}
-        """
-
-    def _apply_typography(self) -> None:
-        family = str(self.config.get("font_family") or "PingFang SC")
-        size = int(self.config.get("font_size") or 13)
-        style = self._chip_style()
-        self.front_chip.setStyleSheet(style)
-        self.back_chip.setStyleSheet(style)
-        font = QFont(family, size)
-        font.setBold(False)
-        self.front_chip.setFont(font)
-        self.back_chip.setFont(font)
-
-    def _make_chip(self) -> QLabel:
-        label = QLabel("")
-        label.setObjectName("contentChip")
-        label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        return label
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(2, 2, 2, 2)
-        root.setSpacing(4)
-        root.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        root.setContentsMargins(4, 0, 4, 0)
+        root.setSpacing(0)
+        self.handle = _MoveHandle(self)
+        root.addWidget(self.handle)
+        self.web = QWebEngineView(self)
+        self.web.setPage(_CardPage(self.web))
+        self.web.page().setBackgroundColor(QColor(0, 0, 0, 0))
+        self.web.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.web.setStyleSheet("background: transparent; border: 0;")
+        root.addWidget(self.web, 1)
+        self.web.loadFinished.connect(self._page_ready)
+        self.web.page().contentsSizeChanged.connect(lambda _: self._queue_measure())
+        self._left_handle = _WidthHandle(self, 'left')
+        self._right_handle = _WidthHandle(self, 'right')
+        self.setMinimumWidth(280)
+        screen = self.screen()
+        height = max(140, screen.availableGeometry().height() - 16) if screen else 700
+        # The native canvas never changes height during reveal/collapse.
+        # Transparent unused space is excluded from the input mask.
+        self.setFixedHeight(height)
+        self.resize(self._card_width, height)
 
-        self.front_chip = self._make_chip()
-        self.back_chip = self._make_chip()
-        self.back_chip.hide()
+    def _clamp_width(self, width: int) -> int:
+        screen = self.screen()
+        maximum = min(900, screen.availableGeometry().width() - 16) if screen else 900
+        return max(280, min(width, maximum))
 
-        root.addWidget(
-            self.front_chip, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
-        )
-        root.addWidget(
-            self.back_chip, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
-        )
-
-        self.setMinimumHeight(24)
-        self.setMaximumHeight(120)
+    def _set_card_width(self, width: int) -> None:
+        self._card_width = self._clamp_width(width)
+        if self.width() != self._card_width:
+            self.resize(self._card_width, self.height())
+        self._queue_measure()
 
     def _apply_geometry_defaults(self) -> None:
-        self.resize(180, 30)
         screen = self.screen()
         geo = screen.availableGeometry() if screen else None
-        x = self.config.get("pos_x")
-        y = self.config.get("pos_y")
+        x, y = self.config.get("pos_x"), self.config.get("pos_y")
         if x is None or y is None:
-            if geo:
-                x = geo.x() + geo.width() // 2 - 90
-                y = geo.y() + 12
-            else:
-                x, y = 200, 40
+            x, y = (geo.center().x() - self._card_width//2, geo.y() + 20) if geo else (200, 40)
+        if geo:
+            x = max(geo.left(), min(int(x), geo.right() - self._card_width))
+            y = max(geo.top(), min(int(y), geo.bottom() - 160))
         self.move(int(x), int(y))
+        self._fit_surface_to_screen()
+
+    def _fit_surface_to_screen(self) -> None:
+        screen = self.screen()
+        if not screen:
+            return
+        geo = screen.availableGeometry()
+        # Recalculate only on initial placement, reopening, or explicit user
+        # movement. Revealing an answer never moves or resizes the window.
+        y = max(geo.top(), min(self.y(), geo.bottom() - 140))
+        if y != self.y():
+            self.move(self.x(), y)
+        height = max(132, geo.bottom() - y - 8)
+        if self.height() != height:
+            self.setFixedHeight(height)
+        self._queue_measure()
+
+    def _save_geometry(self) -> None:
+        self._fit_surface_to_screen()
+        self.config.update(card_width=self.width(), pos_x=self.x(), pos_y=self.y())
+        self._on_config_save(self.config)
+        self.position_changed.emit(self.x(), self.y())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, '_left_handle'):
+            self._left_handle.setGeometry(0, 0, 6, self.height())
+            self._right_handle.setGeometry(self.width() - 6, 0, 6, self.height())
+            self._left_handle.raise_()
+            self._right_handle.raise_()
+            self._queue_measure()
 
     def _install_app_filter(self) -> None:
         app = QApplication.instance()
@@ -208,25 +306,19 @@ class MoyuOverlay(QWidget):
     def _grab_keys(self) -> None:
         if self._keyboard_grabbed:
             return
-        try:
-            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
-            self.raise_()
-            self.activateWindow()
+        self._keyboard_grabbed = True
+        if self.isVisible():
+            self._keyboard_session = True
+            # Explicitly requested hover focus. Activate only once on entry;
+            # never raise/rebuild the window or change its geometry/opacity.
+            if not self.isActiveWindow():
+                self.activateWindow()
             self.setFocus(Qt.FocusReason.OtherFocusReason)
-            self.grabKeyboard()
-            self._keyboard_grabbed = True
-        except Exception:
-            self._keyboard_grabbed = False
 
     def _release_keys(self) -> None:
         if not self._keyboard_grabbed:
             return
-        try:
-            self.releaseKeyboard()
-        except Exception:
-            pass
         self._keyboard_grabbed = False
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
     def show_overlay(self) -> None:
         if not self.controller.can_start():
@@ -238,14 +330,19 @@ class MoyuOverlay(QWidget):
         self._await_mouse_leave = False
         self._hovered = False
         self._pinned_reveal = False
+        self._keyboard_session = False
         self._release_keys()
         self.refresh()
+        self._fit_surface_to_screen()
         self.show()
         self.raise_()
         self._install_app_filter()
         self._hover_timer.start()
 
     def hide_overlay(self) -> None:
+        self._cancel_pending_click()
+        self._keyboard_session = False
+        self._cancel_drag()
         self._hover_timer.stop()
         self._release_keys()
         self._remove_app_filter()
@@ -260,18 +357,23 @@ class MoyuOverlay(QWidget):
             self.show_overlay()
 
     def refresh(self) -> None:
-        max_chars = int(self.config.get("max_chars", 48))
-        text = self.controller.current_text()
-        if not text:
-            self.front_chip.setText("暂无到期")
-            self.back_chip.setText(
-                self.controller.deck_name() or "当前牌组没有可复习的卡片"
-            )
-            self._relayout()
-            return
-
-        self.front_chip.setText(_truncate(text.front, max_chars))
-        self.back_chip.setText(_truncate(text.back, max_chars * 2))
+        parts = self.controller.current_html()
+        if parts:
+            front, back, note = parts
+        else:
+            front, back, note = "<p>暂无到期卡片</p>", "", ""
+        markup = document(front, back, note,
+            font_family=str(self.config.get("font_family") or "PingFang SC"),
+            font_size=int(self.config.get("font_size", 13)))
+        if markup != self._document:
+            self._cancel_pending_click()
+            self._document = markup
+            self._loaded = False
+            self._rendered_expanded = False
+            self._last_expanded = None
+            self._measure_serial += 1
+            base = QUrl(mw.serverURL()) if mw else QUrl()
+            self.web.setHtml(markup, base)
         self._relayout()
 
     def _expanded(self) -> bool:
@@ -279,39 +381,60 @@ class MoyuOverlay(QWidget):
             return False
         return self._hovered or self._pinned_reveal
 
-    def _measure_width(self) -> int:
-        max_w = int(self.config.get("collapsed_width", 520))
-        auto = bool(self.config.get("auto_width", True))
-        chrome = 4
-        self.front_chip.adjustSize()
-        front_w = self.front_chip.sizeHint().width()
-        if self._expanded():
-            self.back_chip.adjustSize()
-            back_w = self.back_chip.sizeHint().width()
-            needed = max(front_w, back_w) + chrome
-            return max(80, min(needed, max(max_w, 720)))
-        needed = front_w + chrome
-        if auto:
-            return max(80, min(needed, max_w))
-        return max_w
+    def _page_ready(self, ok: bool) -> None:
+        self._loaded = ok
+        if ok:
+            self._last_expanded = None
+            self._sync_expanded()
+            self._keep_keyboard_focus()
+
+    def _keep_keyboard_focus(self) -> None:
+        # Keep focus on the persistent native widget across Chromium reloads,
+        # without activating Anki if the user has switched to another app.
+        if self._keyboard_session and self.isVisible() and self.isActiveWindow() and self._anki_active():
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _sync_expanded(self) -> None:
+        if not self._loaded:
+            return
+        expanded = self._expanded()
+        self._measure_serial += 1
+        serial = self._measure_serial
+        if self._last_expanded != expanded:
+            script = "window.moyuSetExpanded && window.moyuSetExpanded(%s)" % ('true' if expanded else 'false')
+            self._last_expanded = expanded
+        else:
+            script = "window.moyuHeight && window.moyuHeight()"
+        self.web.page().runJavaScript(script, lambda h: self._layout_ack(h, serial, expanded))
+
+    def _layout_ack(self, height, serial: int, expanded: bool) -> None:
+        if serial == self._measure_serial and isinstance(height, (int, float)):
+            self._rendered_expanded = expanded
+            self._update_visible_region(height, serial)
+
+    def _queue_measure(self) -> None:
+        if hasattr(self, '_measure_timer'):
+            self._measure_timer.start()
+
+    def _measure_content(self) -> None:
+        self._sync_expanded()
+
+    def _update_visible_region(self, content_height, serial: int) -> None:
+        if serial != self._measure_serial or not isinstance(content_height, (int, float)):
+            return
+        self._visible_height = max(32, min(int(content_height) + 6, self.height()))
+        # Keep native geometry, opacity, and the front capsule unchanged.
+        # Only the hit-test mask follows visible content.
+        region = QRegion(QRect(0, 0, self.width(), self._visible_height))
+        if region != self.mask():
+            self.setMask(region)
 
     def _relayout(self) -> None:
-        expanded = self._expanded()
-        anchor = self.pos()
-        self.back_chip.setVisible(expanded)
-        if expanded:
-            self.setFixedHeight(self.front_chip.sizeHint().height() + self.back_chip.sizeHint().height() + 10)
-            self.setWindowOpacity(min(1.0, self._opacity + 0.05))
+        if self._expanded():
             self._grab_keys()
-        else:
-            self.setFixedHeight(max(28, self.front_chip.sizeHint().height() + 4))
-            self.setWindowOpacity(self._opacity)
-            if not self._hovered and not self._pinned_reveal:
-                self._release_keys()
-        self.setFixedWidth(self._measure_width())
-        self.move(anchor)
-        self.updateGeometry()
-        self.update()
+        elif not self._hovered and not self._pinned_reveal:
+            self._release_keys()
+        self._sync_expanded()
 
     def _reveal_keys(self) -> set[str]:
         sc = self.config.get("shortcuts") or {}
@@ -328,6 +451,24 @@ class MoyuOverlay(QWidget):
         name = str(sc.get("reveal_grade") or "good").lower()
         return {"again": 1, "hard": 2, "good": 3, "easy": 4}.get(name, 3)
 
+    def _click_grade_ease(self) -> int:
+        name = str(self.config.get("click_grade") or "good").lower()
+        return {"again": 1, "hard": 2, "good": 3, "easy": 4}.get(name, 3)
+
+    def _cancel_pending_click(self) -> None:
+        self._click_timer.stop()
+        self._pending_click = None
+
+    def _commit_click_grade(self) -> None:
+        pending = self._pending_click
+        self._pending_click = None
+        if pending is None:
+            return
+        card, markup, ease = pending
+        if (self.isVisible() and self.controller.active and self._loaded and
+                not self._dragging and not self._resizing and self.controller.card is card and self._document == markup):
+            self._on_grade(ease)
+
     def _grade_map(self) -> dict[str, int]:
         sc = self.config.get("shortcuts") or {}
         mapping: dict[str, int] = {}
@@ -341,15 +482,15 @@ class MoyuOverlay(QWidget):
         if not self.isVisible():
             return False
         # Slightly inflate hit area so leaving/entering is reliable after resize.
-        geo = self.frameGeometry().adjusted(-2, -2, 2, 2)
-        return geo.contains(self.cursor().pos())
+        local = self.mapFromGlobal(self.cursor().pos())
+        return QRect(0, 0, self.width(), self._visible_height).adjusted(-2,-2,2,2).contains(local)
 
     def _poll_hover(self) -> None:
-        if not self.isVisible() or self._dragging:
+        if not self.isVisible() or self._dragging or self._resizing:
             return
         over = self._cursor_over_self()
 
-        # Must leave after grading before hover/keys can reveal the next card.
+        # Mouse hover must leave after grading; keyboard input is independent.
         if self._await_mouse_leave:
             if not over:
                 self._await_mouse_leave = False
@@ -380,74 +521,148 @@ class MoyuOverlay(QWidget):
             return False
         return app.applicationState() == Qt.ApplicationState.ApplicationActive
 
-    def _handle_hotkey(self, key: str) -> bool:
-        if not self.isVisible() or not self.controller.active:
-            return False
-        if self.controller.card is None:
+    def _hotkeys_allowed(self) -> bool:
+        if not self.isVisible() or not self.controller.active or self.controller.card is None:
             return False
         if self._typing_in_field():
             return False
-        if self._await_mouse_leave:
+        return bool(self._hovered or self._pinned_reveal or self._cursor_over_self() or self._anki_active())
+
+    def _handle_hotkey(self, key: str) -> bool:
+        if not self._hotkeys_allowed():
             return False
-
-        over_or_pinned = (
-            self._hovered or self._pinned_reveal or self._cursor_over_self()
-        )
-        if not over_or_pinned and not self._anki_active():
-            return False
-
-        if key in self._reveal_keys():
-            if self._expanded():
-                self._on_grade(self._reveal_grade_ease())
-            else:
-                self._pinned_reveal = True
-                self._grab_keys()
-                self._relayout()
-            return True
-
-        # Grade keys (1-4 etc.): reveal when answer hidden; grade when shown.
         ease = self._grade_map().get(key)
-        if ease:
-            if self._expanded():
-                self._on_grade(ease)
-            else:
-                self._pinned_reveal = True
-                self._grab_keys()
-                self._relayout()
-            return True
-        return False
+        reveal_key = key in self._reveal_keys()
+        if not reveal_key and not ease:
+            return False
+        self._cancel_pending_click()
+        self._keyboard_session = True
+        self._keep_keyboard_focus()
+        # The leave/re-enter guard applies only to automatic mouse reveal.
+        # A fresh keyboard press can always reveal the next card. While a new
+        # page is loading, record reveal intent but never grade unseen content.
+        if not self._expanded() or not self._loaded:
+            self._await_mouse_leave = False
+            self._pinned_reveal = True
+            self._grab_keys()
+            self._relayout()
+        else:
+            self._on_grade(self._reveal_grade_ease() if reveal_key else ease)
+        return True
 
     def _on_grade(self, ease: int) -> None:
+        self._cancel_pending_click()
         ok = self.controller.answer(ease)
         if not self.controller.active:
             self.hide_overlay()
             self.closed.emit()
             return
-        # Collapse next card; require mouse leave then re-hover / shortcut.
+        # Collapse the next card. Only automatic hover waits for mouse leave.
         self._await_mouse_leave = True
         self._hovered = False
         self._pinned_reveal = False
         self._release_keys()
         self.refresh()
+        self._keep_keyboard_focus()
         if not ok and self.controller.card is None:
             self.refresh()
 
+    def _begin_drag(self, global_pos: QPoint) -> None:
+        self._cancel_pending_click()
+        self._press_card = self.controller.card
+        self._press_can_grade = bool(self.controller.active and self._expanded() and self._loaded and self._rendered_expanded)
+        self._drag_moved = False
+        self._dragging = True
+        self._drag_start_position = self.pos()
+        self._drag_offset = global_pos - self.pos()
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        # Receive release even when the mouse leaves the visible capsule.
+        self.grabMouse()
+
+    def _continue_drag(self, global_pos: QPoint) -> None:
+        if self._dragging:
+            target = global_pos - self._drag_offset
+            if target != self.pos():
+                self._drag_moved = True
+                self.move(target)
+
+    def _cancel_drag(self) -> None:
+        self._dragging = False
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
+
+    def _finish_drag(self) -> None:
+        if not self._dragging:
+            return
+        moved = self._drag_moved or self.pos() != self._drag_start_position
+        self._cancel_drag()
+        if moved:
+            self._save_geometry()
+        elif self.controller.card is self._press_card and self.controller.active:
+            if self._press_can_grade:
+                self._pending_click = (self._press_card, self._document, self._click_grade_ease())
+                # Wait for the OS double-click window before scoring. Otherwise
+                # the first half of a double-click would already grade a card.
+                self._click_timer.start(QApplication.doubleClickInterval() + 20)
+            elif self.controller.card is not None:
+                # After grading, a click can reveal the next question without
+                # requiring a mouse leave/re-enter; it never scores it unseen.
+                self._await_mouse_leave = False
+                self._pinned_reveal = True
+                self._grab_keys()
+                self._relayout()
+        self._press_card = None
+        self._press_can_grade = False
+        self._queue_measure()
+
+    def _quick_hide(self) -> None:
+        self._cancel_drag()
+        self._resizing = False
+        self._left_handle.origin = self._right_handle.origin = None
+        # No tooltip or notification: this action is meant for quick concealment.
+        self.hide_overlay()
+
     def eventFilter(self, obj, event):  # noqa: N802
         et = event.type()
-        if et == QEvent.Type.KeyPress and self.isVisible():
-            if self._handle_hotkey(_key_from_event(event)):
+        # Chromium delivers mouse input to an internal child, not the
+        # QWebEngineView itself. Filtering the application covers that child
+        # and replacements created after page loads.
+        own_mouse_target = (isinstance(obj, QWidget) and
+                            (obj is self or self.isAncestorOf(obj)))
+        if self.isVisible() and own_mouse_target:
+            if et == QEvent.Type.Wheel:
+                self._cancel_pending_click()
+            if et == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
+                self._quick_hide()
+                event.accept()
                 return True
-        if et == QEvent.Type.ShortcutOverride and self.isVisible():
-            key = _key_from_event(event)
-            over_or_pinned = (
-                self._hovered or self._pinned_reveal or self._cursor_over_self()
-            )
-            if self._await_mouse_leave:
-                return False
-            if over_or_pinned or self._anki_active():
-                if key in self._reveal_keys() or key in self._grade_map():
+            resize_target = obj in (self._left_handle, self._right_handle) or self._resizing
+            if not resize_target:
+                if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                    self._begin_drag(event.globalPosition().toPoint())
                     event.accept()
                     return True
+                if et == QEvent.Type.MouseMove and self._dragging:
+                    self._continue_drag(event.globalPosition().toPoint())
+                    event.accept()
+                    return True
+                if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton and self._dragging:
+                    self._finish_drag()
+                    event.accept()
+                    return True
+        if et == QEvent.Type.KeyPress and self.isVisible():
+            key = _key_from_event(event)
+            if event.isAutoRepeat() and self._hotkeys_allowed() and (key in self._reveal_keys() or key in self._grade_map()):
+                event.accept()
+                return True
+            if self._handle_hotkey(key):
+                event.accept()
+                return True
+        if et == QEvent.Type.ShortcutOverride and self._hotkeys_allowed():
+            key = _key_from_event(event)
+            if key in self._reveal_keys() or key in self._grade_map():
+                event.accept()
+                return True
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
@@ -458,43 +673,34 @@ class MoyuOverlay(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            if (
-                not self._expanded()
-                and self.controller.card
-                and not self._await_mouse_leave
-            ):
-                self._pinned_reveal = True
-                self._grab_keys()
-                self._relayout()
-            self._dragging = True
-            self._drag_offset = (
-                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            )
+            self._begin_drag(event.globalPosition().toPoint())
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if self._dragging and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        if self._dragging:
+            self._continue_drag(event.globalPosition().toPoint())
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self._dragging:
-            self._dragging = False
-            pos = self.pos()
-            self.config["pos_x"] = pos.x()
-            self.config["pos_y"] = pos.y()
-            self._on_config_save(self.config)
-            self.position_changed.emit(pos.x(), pos.y())
+            self._finish_drag()
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._quick_hide()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def paintEvent(self, event) -> None:  # noqa: N802
-        # Fully transparent chrome — only the white capsules are visible.
+        # Separate capsules render their own background; there is no large card.
         painter = QPainter(self)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.fillRect(self.rect(), QColor(0, 0, 0, 0))

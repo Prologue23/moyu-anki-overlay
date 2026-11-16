@@ -6,6 +6,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Optional
 
 from aqt import mw
@@ -44,6 +45,8 @@ def _strip_html(raw: str) -> str:
     """Local HTML stripper — avoids Anki backend strip_html when unavailable."""
     if not raw:
         return ""
+    raw = re.sub(r"<(script|style)\b[^>]*>.*?</\1\s*>", "", raw, flags=re.IGNORECASE | re.DOTALL)
+    raw = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
     try:
         from anki.utils import strip_html as anki_strip
 
@@ -70,10 +73,75 @@ def _clean_plain(raw: str) -> str:
     return text
 
 
+class _WithoutNote(HTMLParser):
+    """Remove explicitly marked note containers without touching other text."""
+    _void = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+             "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.parts = []
+        self.depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        markers = {attrs.get("id", "").casefold(),
+                   *attrs.get("class", "").casefold().split()}
+        if self.depth:
+            if tag not in self._void:
+                self.depth += 1
+        elif markers & {"note", "notes", "备注", "注释", "笔记"}:
+            if tag not in self._void:
+                self.depth = 1
+        else:
+            self.parts.append(self.get_starttag_text())
+
+    def handle_startendtag(self, tag, attrs):
+        if not self.depth:
+            self.handle_starttag(tag, attrs)
+            self.depth = 0
+
+    def handle_endtag(self, tag):
+        if self.depth:
+            self.depth -= 1
+        else:
+            self.parts.append("</" + tag + ">")
+
+    def handle_data(self, data):
+        if not self.depth:
+            self.parts.append(data)
+
+    def handle_entityref(self, name):
+        self.handle_data("&" + name + ";")
+
+    def handle_charref(self, name):
+        self.handle_data("&#" + name + ";")
+
+
+def _without_note(raw: str) -> str:
+    parser = _WithoutNote()
+    parser.feed(raw)
+    parser.close()
+    return "".join(parser.parts)
+
+
+def _separate_note(text: str, note: str) -> str:
+    # Common templates append an unmarked {{Note}} after the answer. Remove
+    # only a distinct suffix, not matching words inside the question/answer.
+    if note and text != note and text.endswith(note):
+        prefix = text[:-len(note)]
+        if prefix and (prefix[-1].isspace() or prefix[-1] in "|:：—–-"):
+            prefix = re.sub(r"(?:^|\s)(?:Notes?|备注|注释)\s*[:：]?\s*$", "", prefix,
+                            flags=re.IGNORECASE)
+            return prefix.rstrip(" |:：—–-")
+    return text
+
+
 @dataclass
 class CardText:
     front: str
     back: str
+    note: str = ""
 
 
 class ReviewController:
@@ -126,9 +194,32 @@ class ReviewController:
             return None
         front_html = self.card.question()
         answer_html = self.card.answer()
-        front = self._front_plain(front_html)
-        back = self._answer_plain(answer_html, front)
-        return CardText(front=front or "（空白正面）", back=back or "（空白背面）")
+        note = ""
+        for name, value in self.card.note().items():
+            if name.strip().casefold() in {"note", "notes", "备注", "注释", "笔记"}:
+                note = _clean_plain(value)
+                if note:
+                    break
+        # Keep card rendering (including reversed/cloze cards); only separate
+        # note content so it is not exposed before the answer or shown twice.
+        if note:
+            front_html = _without_note(front_html)
+            answer_html = _without_note(answer_html)
+        front = _separate_note(self._front_plain(front_html), note)
+        back = _separate_note(self._answer_plain(answer_html, front), note)
+        return CardText(front=front or "（空白正面）", back=back or "（空白背面）", note=note)
+
+    def current_html(self) -> Optional[tuple[str, str, str]]:
+        """Keep the actual card direction, CSS and note markup for the web view."""
+        if not self.card:
+            return None
+        note = ""
+        for name, value in self.card.note().items():
+            if name.strip().casefold() in {"note", "notes", "备注", "注释", "笔记"}:
+                if _clean_plain(value):
+                    note = value
+                    break
+        return self.card.question(), self.card.answer(), note
 
     def answer(self, ease: int) -> bool:
         if not self.active or not self.card or not mw or not mw.col:

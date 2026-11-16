@@ -96,12 +96,13 @@ New-Item -ItemType SymbolicLink `
 1. Start Anki and select a deck with due cards
 2. If auto-show is on, a pill appears near the top; otherwise **Tools → Show/Hide Moyu Overlay** (default `Ctrl+Shift+M` / `⌃⇧M`)
 3. **Reveal answer:** hover, or press reveal shortcuts (default Space / Enter), or a grade digit (also reveals when hidden)
-4. **Grade** (answer visible): `1` Again · `2` Hard · `3` Good · `4` Easy; Space/Enter grades per “After reveal” setting (default Good)
-5. After grading, if the cursor stays on the pill, the next answer stays hidden until you **leave and re-enter**
-6. Drag the pill to reposition (saved in config)
+4. **Pointer grade:** once the answer is visible, a single click defaults to Good (configurable under Touchpad / Mouse). Double-click hides without grading; dragging never grades. Single-click submission waits for the system double-click interval.
+5. **Keyboard grade** (answer visible): `1` Again · `2` Hard · `3` Good · `4` Easy; Space/Enter grades per “After reveal” setting (default Good)
+5. After grading, the next answer starts hidden. Press a review key to continue immediately; only automatic hover waits for mouse leave/re-entry
+6. Hold and drag anywhere on the text to move; double-click to hide silently. Drag either side to resize (330 px by default, saved). Notes use the available screen height before falling back to scrolling.
 
 ```text
-Question → Space/hover to reveal → 1–4 to grade → move mouse away → next card
+Question → Space to reveal → 1–4 to grade → next card → Space to continue
 ```
 
 ---
@@ -113,9 +114,8 @@ Question → Space/hover to reveal → 1–4 to grade → move mouse away → ne
 | Group | Option | Meaning |
 | --- | --- | --- |
 | Appearance | Opacity | Pill transparency |
-| Appearance | Max chars / max width | Truncate long text |
+| Appearance | Card width | Default 330 px; wraps without truncating content |
 | Appearance | Show/Hide hotkey | Global toggle |
-| Appearance | Hug content width | Frame shrinks to text |
 | Appearance | Auto-show on start | Show after profile load |
 | Font | Family / size | On Windows prefer a system CJK font |
 | Reveal | Shortcuts A / B | Default Space, Enter |
@@ -127,9 +127,9 @@ Question → Space/hover to reveal → 1–4 to grade → move mouse away → ne
 ## Notes
 
 1. Anki must be running for reviews to be saved and synced.
-2. Shortcuts only work when Anki can receive keys; hovering the pill grabs focus when possible.
+2. Hover reveals and focuses the overlay so keyboard review can continue directly.
 3. Don’t run main Reviewer and overlay together; overlay hides during main review.
-4. Content is plain text of rendered front/back — no full templates, images, or audio.
+4. Renders the card HTML/CSS, preserving paragraphs, emphasis, lists and note styling. Field labels and typing controls are hidden. Surfaces default to opaque white with black ordinary text while explicit color highlights are preserved. Notes expand into available screen space; only content exceeding it scrolls. Template scripts do not execute in the overlay. Reveal keeps the same question DOM node and native geometry, with constant opacity. Unused transparent space is excluded from the input mask.
 
 ---
 

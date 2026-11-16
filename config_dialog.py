@@ -267,16 +267,18 @@ class CapsuleKeyEdit(QLineEdit):
 
 def _defaults() -> dict:
     return {
-        "opacity": 0.88,
+        "opacity": 1.0,
+        "opaque_style_version": 1,
         "auto_show": True,
         "pos_x": None,
         "pos_y": None,
-        "max_chars": 48,
-        "collapsed_width": 520,
-        "auto_width": True,
+        "card_width": 330,
+        "presentation_version": 2,
         "font_family": "PingFang SC",
-        "font_size": 13,
+        "font_size": 15,
+        "capsule_style_version": 1,
         "toggle_shortcut": "Ctrl+Shift+M",
+        "click_grade": "good",
         "shortcuts": {
             "again": "1",
             "hard": "2",
@@ -313,6 +315,19 @@ def merge_config(user: Optional[dict]) -> dict:
                 sc["reveal_2"] = extras[1]
         sc.update({k: v for k, v in user_sc.items() if k != "good_extra"})
     conf["shortcuts"] = sc
+    if int(user.get("presentation_version", 0)) < 2:
+        # One-time migration from the large phone-card presentation.
+        conf["card_width"] = min(int(conf.get("card_width", 330)), 330)
+        conf["font_size"] = min(int(conf.get("font_size", 13)), 13)
+        conf["presentation_version"] = 2
+    if int(user.get("capsule_style_version", 0)) < 1:
+        # Restore the user's original 15px capsule typography once. Later
+        # font-size changes remain user-controlled, just like width changes.
+        conf["font_size"] = 15
+        conf["capsule_style_version"] = 1
+    if int(user.get("opaque_style_version", 0)) < 1:
+        conf["opacity"] = 1.0
+        conf["opaque_style_version"] = 1
     return conf
 
 
@@ -436,29 +451,21 @@ class MoyuConfigDialog(QDialog):
         self.opacity.setRange(0.35, 1.0)
         self.opacity.setSingleStep(0.05)
         self.opacity.setDecimals(2)
-        self.opacity.setValue(float(self._conf.get("opacity", 0.88)))
+        self.opacity.setValue(float(self._conf.get("opacity", 1.0)))
         _style_capsule(self.opacity)
-        self.max_chars = QSpinBox()
-        self.max_chars.setRange(12, 120)
-        self.max_chars.setValue(int(self._conf.get("max_chars", 48)))
-        _style_capsule(self.max_chars)
         self.max_width = QSpinBox()
-        self.max_width.setRange(200, 900)
+        self.max_width.setRange(280, 900)
         self.max_width.setSuffix(" px")
-        self.max_width.setValue(int(self._conf.get("collapsed_width", 520)))
+        self.max_width.setValue(int(self._conf.get("card_width", 330)))
         _style_capsule(self.max_width)
         self.toggle_shortcut = CapsuleKeyEdit(
             str(self._conf.get("toggle_shortcut") or "Ctrl+Shift+M")
         )
-        self.auto_width = QCheckBox("自动贴合内容宽度")
-        self.auto_width.setChecked(bool(self._conf.get("auto_width", True)))
         self.auto_show = QCheckBox("启动后自动显示悬浮条")
         self.auto_show.setChecked(bool(self._conf.get("auto_show", True)))
         appear.add_row(_row("不透明度", self.opacity))
-        appear.add_row(_row("最大字数", self.max_chars))
-        appear.add_row(_row("最大宽度", self.max_width, "限制超长句子"))
+        appear.add_row(_row("卡片宽度", self.max_width, "默认轻巧窄条，也可拖动左右边缘"))
         appear.add_row(_row("显示 / 隐藏", self.toggle_shortcut))
-        appear.add_row(_check_row(self.auto_width))
         appear.add_row(_check_row(self.auto_show))
         body.addWidget(appear)
         body.addSpacing(10)
@@ -501,6 +508,19 @@ class MoyuConfigDialog(QDialog):
             _row("显示后再按", self.reveal_grade, "答案已显示时，A/B 键执行的评分")
         )
         body.addWidget(reveal)
+        body.addSpacing(10)
+
+        # Pointer grading is independent of the reveal-key grade setting.
+        body.addWidget(_section("触摸板 / 鼠标"))
+        pointer = _Group()
+        self.click_grade = QComboBox()
+        for key, label in _GRADE_OPTIONS:
+            self.click_grade.addItem(label, key)
+        idx = self.click_grade.findData(self._conf.get("click_grade", "good"))
+        self.click_grade.setCurrentIndex(idx if idx >= 0 else 2)
+        _style_capsule(self.click_grade)
+        pointer.add_row(_row("单击评分", self.click_grade, "答案显示后单击；双击隐藏，拖动不评分"))
+        body.addWidget(pointer)
         body.addSpacing(10)
 
         # Grade
@@ -546,9 +566,7 @@ class MoyuConfigDialog(QDialog):
     def _restore_defaults(self) -> None:
         d = _defaults()
         self.opacity.setValue(d["opacity"])
-        self.max_chars.setValue(d["max_chars"])
-        self.max_width.setValue(d["collapsed_width"])
-        self.auto_width.setChecked(True)
+        self.max_width.setValue(d["card_width"])
         self.auto_show.setChecked(True)
         self.toggle_shortcut.setKeySequence(QKeySequence(d["toggle_shortcut"]))
         self.font_family.setCurrentFont(QFont(d["font_family"]))
@@ -559,6 +577,7 @@ class MoyuConfigDialog(QDialog):
         rg = str(sc.get("reveal_grade") or "good")
         idx = self.reveal_grade.findData(rg)
         self.reveal_grade.setCurrentIndex(idx if idx >= 0 else 2)
+        self.click_grade.setCurrentIndex(2)
         self.key_again.setKeySequence(QKeySequence(sc["again"]))
         self.key_hard.setKeySequence(QKeySequence(sc["hard"]))
         self.key_good.setKeySequence(QKeySequence(sc["good"]))
@@ -570,10 +589,9 @@ class MoyuConfigDialog(QDialog):
 
     def _save(self) -> None:
         conf = merge_config(self._conf)
+        conf["click_grade"] = self.click_grade.currentData() or "good"
         conf["opacity"] = float(self.opacity.value())
-        conf["max_chars"] = int(self.max_chars.value())
-        conf["collapsed_width"] = int(self.max_width.value())
-        conf["auto_width"] = bool(self.auto_width.isChecked())
+        conf["card_width"] = int(self.max_width.value())
         conf["auto_show"] = bool(self.auto_show.isChecked())
         conf["toggle_shortcut"] = self._seq_str(self.toggle_shortcut) or "Ctrl+Shift+M"
         conf["font_family"] = self.font_family.currentFont().family() or "PingFang SC"

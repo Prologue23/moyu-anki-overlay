@@ -1,13 +1,10 @@
 {
-  "opacity": 0.88,
+  "opacity": 1.0,
   "auto_show": true,
   "pos_x": null,
   "pos_y": null,
-  "max_chars": 48,
-  "collapsed_width": 520,
-  "auto_width": true,
   "font_family": "PingFang SC",
-  "font_size": 13,
+  "font_size": 15,
   "toggle_shortcut": "Ctrl+Shift+M",
   "shortcuts": {
     "again": "1",
@@ -17,5 +14,7 @@
     "reveal_1": "Space",
     "reveal_2": "Return",
     "reveal_grade": "good"
-  }
+  },
+  "card_width": 330,
+  "click_grade": "good"
 }

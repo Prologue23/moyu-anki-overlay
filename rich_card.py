@@ -37,12 +37,14 @@ def document(front: str, back: str, note: str = '', *, font_family='PingFang SC'
 html, body {{ margin:0 !important; padding:0 !important; min-height:0 !important;
     width:100% !important; height:auto !important; background:transparent !important; overflow:hidden !important; }}
 body {{ font-family:{family} !important; color:#000000 !important; text-align:left !important; }}
-#moyu-content {{ width:100%; box-sizing:border-box; padding:0; overflow-wrap:anywhere; display:flow-root; }}
+#moyu-content {{ width:100%; max-height:100vh; box-sizing:border-box; padding:0;
+    overflow-wrap:anywhere; display:flow-root; overflow-y:auto; overflow-x:hidden;
+    scrollbar-gutter:stable; }}
 #moyu-front {{ display:flow-root; width:fit-content; max-width:100%; box-sizing:border-box;
     border-radius:11px; padding:5px 12px; background:#ffffff;
-    max-height:60px; overflow:auto; scrollbar-width:thin; }}
-#moyu-back {{ display:flow-root; margin-top:5px; min-width:0; visibility:hidden; pointer-events:none; }}
-body.moyu-expanded #moyu-back {{ visibility:visible; pointer-events:auto; }}
+    height:auto !important; max-height:none !important; overflow:visible !important; }}
+#moyu-back {{ display:none; margin-top:5px; min-width:0; visibility:hidden; pointer-events:none; }}
+body.moyu-expanded #moyu-back {{ display:flow-root; visibility:visible; pointer-events:auto; }}
 #moyu-content .wrap, #moyu-content .card-box {{ width:100% !important; max-width:none !important;
     padding:0 !important; margin:0 !important; display:block !important;
     border:none !important; border-radius:0 !important; background:transparent !important; box-shadow:none !important; }}
@@ -57,15 +59,14 @@ body.moyu-expanded #moyu-back {{ visibility:visible; pointer-events:auto; }}
     padding:5px 12px !important; margin:0 !important; background:#ffffff !important;
     color:#000000 !important; border:0 !important; border-radius:11px !important;
     font-size:var(--moyu-size) !important; line-height:1.5 !important;
-    text-align:left !important; max-height:64px; overflow:auto; }}
+    text-align:left !important; height:auto !important; max-height:none !important; overflow:visible !important; }}
 #moyu-back .answer *, #moyu-back .moyu-answer *, #moyu-back #back * {{ font-size:inherit !important; }}
 #moyu-back .answer p, #moyu-back .moyu-answer p {{ margin:0; }}
 #moyu-content .note, #moyu-content #note, #moyu-content .notes {{
     width:100% !important; max-width:100% !important; box-sizing:border-box;
     margin:5px 0 0 !important; padding:8px 12px !important; border:0 !important;
     border-radius:11px !important; background:#ffffff !important;
-    max-height:var(--moyu-note-limit,calc(100vh - 90px)) !important; overflow-y:auto !important; overflow-x:hidden !important;
-    scrollbar-gutter:stable; }}
+    height:auto !important; max-height:none !important; overflow:visible !important; }}
 #moyu-content .note-text, #moyu-content .note-text * {{ font-size:var(--moyu-note) !important;
     line-height:1.6 !important; }}
 #moyu-content .note-text {{ color:#000000 !important; }}
@@ -131,19 +132,10 @@ body.moyu-expanded #moyu-back {{ visibility:visible; pointer-events:auto; }}
             (values.length < 4 || values[3] >= .99))
             el.style.setProperty('color','#000000','important');
     }});
-    const fitNotes = () => {{
-        const viewport = document.documentElement.clientHeight;
-        back.querySelectorAll('.note,#note,.notes').forEach(el => {{
-            if (getComputedStyle(el).display === 'none') return;
-            const available = Math.max(40,Math.floor(viewport-el.getBoundingClientRect().top-4));
-            const limit = available+'px';
-            if (el.style.getPropertyValue('max-height') !== limit)
-                el.style.setProperty('max-height',limit,'important');
-        }});
-    }};
     window.moyuHeight = () => {{
-        fitNotes();
-        return Math.ceil((document.body.classList.contains('moyu-expanded') ? back : front).getBoundingClientRect().bottom);
+        // Capsules use their natural height. Only the complete card scrolls
+        // when it exceeds the fixed native surface's available screen space.
+        return Math.ceil(document.getElementById('moyu-content').getBoundingClientRect().bottom);
     }};
     window.moyuSetExpanded = expanded => {{
         document.body.classList.toggle('moyu-expanded',expanded);

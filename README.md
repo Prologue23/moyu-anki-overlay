@@ -100,7 +100,8 @@ New-Item -ItemType SymbolicLink `
    **Undo:** Command+Z on Mac / Ctrl+Z on Windows restores the last overlay review and reopens its answer using Anki's native undo. A pending click is cancelled before submission. Undo is guarded against unrelated Anki edits, deck/profile switches, and main-window reviewing; it does not intercept typing in other fields.
 5. **Keyboard grade** (answer visible): `1` Again · `2` Hard · `3` Good · `4` Easy; Space/Enter grades per “After reveal” setting (default Good)
 5. After grading, the next answer starts hidden. Press a review key to continue immediately; only automatic hover waits for mouse leave/re-entry
-6. Hold and drag anywhere on the text to move; double-click to hide silently. Drag either side to resize (330 px by default, saved). Questions, answers, and notes expand to their full content height. Only the complete card scrolls when it exceeds the available screen height.
+6. **macOS full screen / Spaces:** the overlay is an independent floating tool panel on all desktops, including full-screen apps. It can be opened while Anki itself is full screen and remains visible when switching apps. macOS 13+ additionally uses the native join-all-applications policy. The nonactivating panel can own keyboard focus while the browser remains the active app; pointer grading uses panel focus rather than requiring Anki to be active.
+7. Hold and drag anywhere on the text to move; double-click to hide silently. Drag either side to resize (330 px by default, saved). Questions, answers, and notes expand to their full content height. Only the complete card scrolls when it exceeds the available screen height.
 
 ```text
 Question → Space to reveal → 1–4 to grade → next card → Space to continue

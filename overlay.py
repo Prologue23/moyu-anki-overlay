@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
 from typing import Callable, Optional
 
 from aqt import mw
@@ -33,6 +36,7 @@ from aqt.qt import (
 from .config_dialog import merge_config
 from .review_controller import ReviewController
 from .rich_card import document
+from .mac_window import configure_overlay, focus_overlay, has_keyboard_focus, window_status
 
 
 def _normalize_key_name(name: str) -> str:
@@ -175,10 +179,19 @@ class MoyuOverlay(QWidget):
         self._filter_installed = False
         self._keyboard_grabbed = False
         self._keyboard_session = False
+        self._space_refresh = QTimer(self)
+        self._space_refresh.setSingleShot(True)
+        self._space_refresh.setInterval(150)
+        self._space_refresh.timeout.connect(self._refresh_space_policy)
+        self._space_settled = QTimer(self)
+        self._space_settled.setSingleShot(True)
+        self._space_settled.setInterval(1000)
+        self._space_settled.timeout.connect(self._refresh_space_policy)
+        self._last_space_status = None
 
         self.setObjectName("MoyuOverlay")
         self.setWindowFlags(
-            Qt.WindowType.Window
+            (Qt.WindowType.Tool if sys.platform == "darwin" else Qt.WindowType.Window)
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.NoDropShadowWindowHint
@@ -308,6 +321,24 @@ class MoyuOverlay(QWidget):
             app.removeEventFilter(self)
             self._filter_installed = False
 
+    def _window_has_focus(self) -> bool:
+        if self.isActiveWindow() and self._anki_active():
+            return True
+        try:
+            return self.isVisible() and has_keyboard_focus(self)
+        except Exception:
+            return False
+
+    def _focus_review_window(self) -> None:
+        if not self._window_has_focus():
+            try:
+                focused = focus_overlay(self)
+            except Exception:
+                focused = False
+            if not focused:
+                self.activateWindow()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def _grab_keys(self) -> None:
         if self._keyboard_grabbed:
             return
@@ -316,9 +347,7 @@ class MoyuOverlay(QWidget):
             self._keyboard_session = True
             # Explicitly requested hover focus. Activate only once on entry;
             # never raise/rebuild the window or change its geometry/opacity.
-            if not self.isActiveWindow():
-                self.activateWindow()
-            self.setFocus(Qt.FocusReason.OtherFocusReason)
+            self._focus_review_window()
 
     def _release_keys(self) -> None:
         if not self._keyboard_grabbed:
@@ -339,12 +368,49 @@ class MoyuOverlay(QWidget):
         self._release_keys()
         self.refresh()
         self._fit_surface_to_screen()
+        self._apply_space_policy()
         self.show()
         self.raise_()
         self._install_app_filter()
         self._hover_timer.start()
 
+    def _apply_space_policy(self) -> None:
+        try:
+            configure_overlay(self)
+        except Exception as error:
+            # Do not silently abort opening the overlay if an OS API fails.
+            # A single diagnostic per instance avoids a noisy log on re-show.
+            if not getattr(self, "_space_policy_error_logged", False):
+                self._space_policy_error_logged = True
+                try:
+                    with Path(__file__).with_name("moyu_debug.log").open("a", encoding="utf-8") as log:
+                        log.write("fullscreen panel policy failed: " + str(error) + "\n")
+                except OSError:
+                    pass
+
+    def _refresh_space_policy(self) -> None:
+        if not self.isVisible():
+            return
+        self._apply_space_policy()
+        try:
+            status = window_status(self)
+            if status and status != self._last_space_status:
+                self._last_space_status = status
+                with Path(__file__).with_name("moyu_debug.log").open("a", encoding="utf-8") as log:
+                    log.write("fullscreen panel status: " + json.dumps(status, sort_keys=True) + "\n")
+        except Exception:
+            pass
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._apply_space_policy()
+        # Qt may finish applying native window flags during the show cycle.
+        # Reapply once after that cycle, never raise/activate on a timer.
+        QTimer.singleShot(0, self._refresh_space_policy)
+
     def hide_overlay(self) -> None:
+        self._space_refresh.stop()
+        self._space_settled.stop()
         self._cancel_pending_click()
         self._keyboard_session = False
         self._cancel_drag()
@@ -396,7 +462,7 @@ class MoyuOverlay(QWidget):
     def _keep_keyboard_focus(self) -> None:
         # Keep focus on the persistent native widget across Chromium reloads,
         # without activating Anki if the user has switched to another app.
-        if self._keyboard_session and self.isVisible() and self.isActiveWindow() and self._anki_active():
+        if self._keyboard_session and self.isVisible() and self._window_has_focus():
             self.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _sync_expanded(self) -> None:
@@ -493,9 +559,7 @@ class MoyuOverlay(QWidget):
 
     def _focus_and_reveal(self) -> None:
         self._keyboard_session = True
-        if not self.isActiveWindow():
-            self.activateWindow()
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._focus_review_window()
         if self.controller.card is not None:
             self._await_mouse_leave = False
             self._pinned_reveal = True
@@ -504,7 +568,7 @@ class MoyuOverlay(QWidget):
     def _undo_allowed(self) -> bool:
         return bool(self.isVisible() and self.controller.active and
                     not self._typing_in_field() and
-                    (self.isActiveWindow() or self._cursor_over_self()))
+                    (self._window_has_focus() or self._cursor_over_self()))
 
     def _undo_answer(self) -> None:
         # If the click has not been submitted, simply cancel it; never undo
@@ -574,7 +638,14 @@ class MoyuOverlay(QWidget):
         app = QApplication.instance()
         if not app:
             return False
-        return app.applicationState() == Qt.ApplicationState.ApplicationActive
+        if app.applicationState() == Qt.ApplicationState.ApplicationActive:
+            return True
+        # A nonactivating Cocoa panel may be key while Safari remains the
+        # active application. Keep continuous keyboard review in that panel.
+        try:
+            return self.isVisible() and has_keyboard_focus(self)
+        except Exception:
+            return False
 
     def _hotkeys_allowed(self) -> bool:
         if not self.isVisible() or not self.controller.active or self.controller.card is None:
@@ -639,7 +710,7 @@ class MoyuOverlay(QWidget):
             self._cancel_pending_click()
             self._press_count = 2 if double_click else 1
             self._press_can_grade = bool(self.controller.active and self._expanded() and self._loaded and self._rendered_expanded)
-            self._press_focus_only = self._refocus_click_required or not self.isActiveWindow() or not self._anki_active()
+            self._press_focus_only = self._refocus_click_required or not self._window_has_focus()
             self._press_anchor = QPoint(global_pos)
         self._press_card = self.controller.card
         self._drag_moved = False
@@ -647,9 +718,7 @@ class MoyuOverlay(QWidget):
         self._drag_start_position = self.pos()
         self._drag_offset = global_pos - self.pos()
         self._keyboard_session = True
-        if not self.isActiveWindow():
-            self.activateWindow()
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._focus_review_window()
         self.grabMouse()
 
     def _continue_drag(self, global_pos: QPoint) -> None:
@@ -699,13 +768,23 @@ class MoyuOverlay(QWidget):
     def eventFilter(self, obj, event):  # noqa: N802
         et = event.type()
         if et in (QEvent.Type.WindowDeactivate, QEvent.Type.ApplicationDeactivate) and (obj is self or obj is QApplication.instance()):
-            self._refocus_click_required = True
-            self._cancel_pending_click()
+            # Safari can remain the active app while our nonactivating panel
+            # owns the keyboard. App inactivity alone is not a focus loss.
+            if not self._window_has_focus():
+                self._refocus_click_required = True
+                self._cancel_pending_click()
         if et in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress) and self._undo_allowed() and event.matches(QKeySequence.StandardKey.Undo):
             if et == QEvent.Type.KeyPress and not event.isAutoRepeat():
                 self._undo_answer()
             event.accept()
             return True
+        if (self.isVisible() and et in (QEvent.Type.ApplicationActivate,
+                QEvent.Type.ApplicationDeactivate, QEvent.Type.ApplicationStateChange) and
+                obj is QApplication.instance()):
+            # Qt/AppKit may adjust tool-window levels during activation. Restore
+            # the policy once after the transition, without raising or moving.
+            self._space_refresh.start()
+            self._space_settled.start()
         # Chromium delivers mouse input to an internal child, not the
         # QWebEngineView itself. Filtering the application covers that child
         # and replacements created after page loads.

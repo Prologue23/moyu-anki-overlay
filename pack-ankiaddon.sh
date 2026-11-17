@@ -18,6 +18,7 @@ zip -r "$OUT" \
   overlay.py \
   review_controller.py \
   rich_card.py \
+  mac_window.py \
   config_dialog.py \
   config.json \
   config.md \

@@ -48,10 +48,13 @@ def _normalize_key_name(name: str) -> str:
         "Enter": "Return",
         "\n": "Return",
         "\r": "Return",
+        "Esc": "Escape",
+        "Escape": "Escape",
     }
     if n in aliases:
         return aliases[n]
-    return QKeySequence(n).toString(QKeySequence.SequenceFormat.PortableText) or n
+    normalized = QKeySequence(n).toString(QKeySequence.SequenceFormat.PortableText) or n
+    return aliases.get(normalized, normalized)
 
 
 def _key_from_event(event) -> str:
@@ -63,6 +66,8 @@ def _key_from_event(event) -> str:
         return "Space"
     if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
         return "Return"
+    if k == Qt.Key.Key_Escape:
+        return "Escape"
     if int(Qt.Key.Key_0) <= int(k) <= int(Qt.Key.Key_9):
         return str(int(k) - int(Qt.Key.Key_0))
     if int(Qt.Key.Key_A) <= int(k) <= int(Qt.Key.Key_Z):
@@ -597,6 +602,15 @@ class MoyuOverlay(QWidget):
                 mapping[key] = ease
         return mapping
 
+    def _delete_keys(self) -> set[str]:
+        sc = self.config.get("shortcuts") or {}
+        out = set()
+        for key in (sc.get("delete_card"), sc.get("delete_card_2")):
+            n = _normalize_key_name(str(key or ""))
+            if n:
+                out.add(n)
+        return out
+
     def _cursor_over_self(self) -> bool:
         if not self.isVisible():
             return False
@@ -657,9 +671,10 @@ class MoyuOverlay(QWidget):
     def _handle_hotkey(self, key: str) -> bool:
         if not self._hotkeys_allowed():
             return False
+        delete_key = key in self._delete_keys()
         ease = self._grade_map().get(key)
         reveal_key = key in self._reveal_keys()
-        if not reveal_key and not ease:
+        if not delete_key and not reveal_key and not ease:
             return False
         self._cancel_pending_click()
         self._refocus_click_required = False
@@ -667,12 +682,15 @@ class MoyuOverlay(QWidget):
         self._keep_keyboard_focus()
         # The leave/re-enter guard applies only to automatic mouse reveal.
         # A fresh keyboard press can always reveal the next card. While a new
-        # page is loading, record reveal intent but never grade unseen content.
+        # page is loading, record reveal intent but never grade/delete unseen content.
+        # Delete keys match grade keys: reveal first, act only when expanded.
         if not self._expanded() or not self._loaded:
             self._await_mouse_leave = False
             self._pinned_reveal = True
             self._grab_keys()
             self._relayout()
+        elif delete_key:
+            self._on_delete_card()
         else:
             self._on_grade(self._reveal_grade_ease() if reveal_key else ease)
         return True
@@ -685,6 +703,22 @@ class MoyuOverlay(QWidget):
             self.closed.emit()
             return
         # Collapse the next card. Only automatic hover waits for mouse leave.
+        self._await_mouse_leave = True
+        self._hovered = False
+        self._pinned_reveal = False
+        self._release_keys()
+        self.refresh()
+        self._keep_keyboard_focus()
+        if not ok and self.controller.card is None:
+            self.refresh()
+
+    def _on_delete_card(self) -> None:
+        self._cancel_pending_click()
+        ok = self.controller.delete_current_card()
+        if not self.controller.active:
+            self.hide_overlay()
+            self.closed.emit()
+            return
         self._await_mouse_leave = True
         self._hovered = False
         self._pinned_reveal = False
@@ -814,7 +848,9 @@ class MoyuOverlay(QWidget):
                     return True
         if et == QEvent.Type.KeyPress and self.isVisible():
             key = _key_from_event(event)
-            if event.isAutoRepeat() and self._hotkeys_allowed() and (key in self._reveal_keys() or key in self._grade_map()):
+            if event.isAutoRepeat() and self._hotkeys_allowed() and (
+                    key in self._reveal_keys() or key in self._grade_map() or
+                    key in self._delete_keys()):
                 event.accept()
                 return True
             if self._handle_hotkey(key):
@@ -822,7 +858,8 @@ class MoyuOverlay(QWidget):
                 return True
         if et == QEvent.Type.ShortcutOverride and self._hotkeys_allowed():
             key = _key_from_event(event)
-            if key in self._reveal_keys() or key in self._grade_map():
+            if (key in self._reveal_keys() or key in self._grade_map() or
+                    key in self._delete_keys()):
                 event.accept()
                 return True
         return super().eventFilter(obj, event)

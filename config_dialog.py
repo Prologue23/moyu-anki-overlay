@@ -239,7 +239,7 @@ class CapsuleKeyEdit(QLineEdit):
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         key = event.key()
-        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete, Qt.Key.Key_Escape):
+        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
             self._seq = QKeySequence()
             self._refresh()
             event.accept()
@@ -286,6 +286,8 @@ def _defaults() -> dict:
             "hard": "2",
             "good": "3",
             "easy": "4",
+            "delete_card": "0",
+            "delete_card_2": "Escape",
             "reveal_1": "Space",
             "reveal_2": "Return",
             "reveal_grade": "good",
@@ -543,10 +545,14 @@ class MoyuConfigDialog(QDialog):
         self.key_hard = CapsuleKeyEdit(str(sc.get("hard") or "2"))
         self.key_good = CapsuleKeyEdit(str(sc.get("good") or "3"))
         self.key_easy = CapsuleKeyEdit(str(sc.get("easy") or "4"))
+        self.key_delete = CapsuleKeyEdit(str(sc.get("delete_card") or "0"))
+        self.key_delete_2 = CapsuleKeyEdit(str(sc.get("delete_card_2") or "Escape"))
         grade.add_row(_row("重来", self.key_again))
         grade.add_row(_row("困难", self.key_hard))
         grade.add_row(_row("良好", self.key_good))
         grade.add_row(_row("简单", self.key_easy))
+        grade.add_row(_row("删除卡片 A", self.key_delete, "只删当前卡片，同笔记其他卡片保留"))
+        grade.add_row(_row("删除卡片 B", self.key_delete_2, "与 A 相同；默认 Esc"))
         body.addWidget(grade)
         body.addSpacing(24)
         body.addStretch(0)
@@ -597,6 +603,8 @@ class MoyuConfigDialog(QDialog):
         self.key_hard.setKeySequence(QKeySequence(sc["hard"]))
         self.key_good.setKeySequence(QKeySequence(sc["good"]))
         self.key_easy.setKeySequence(QKeySequence(sc["easy"]))
+        self.key_delete.setKeySequence(QKeySequence(sc.get("delete_card") or "0"))
+        self.key_delete_2.setKeySequence(QKeySequence(sc.get("delete_card_2") or "Escape"))
 
     @staticmethod
     def _seq_str(edit: CapsuleKeyEdit) -> str:
@@ -618,6 +626,8 @@ class MoyuConfigDialog(QDialog):
             "hard": self._seq_str(self.key_hard) or "2",
             "good": self._seq_str(self.key_good) or "3",
             "easy": self._seq_str(self.key_easy) or "4",
+            "delete_card": self._seq_str(self.key_delete) or "0",
+            "delete_card_2": self._seq_str(self.key_delete_2) or "Escape",
             "reveal_1": self._seq_str(self.key_reveal_1) or "Space",
             "reveal_2": self._seq_str(self.key_reveal_2) or "Return",
             "reveal_grade": self.reveal_grade.currentData() or "good",

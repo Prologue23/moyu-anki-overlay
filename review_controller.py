@@ -250,6 +250,46 @@ class ReviewController:
 
         return self.load_next()
 
+    def delete_current_card(self) -> bool:
+        """Remove only the current card; sibling cards (and the note) stay if any remain."""
+        if not self.active or not self.card or not mw or not mw.col:
+            return False
+        if mw.state == "review":
+            tooltip("主界面正在复习，已暂停摸鱼取卡。")
+            self.stop()
+            return False
+
+        col = mw.col
+        card_id = self.card.id
+        note_id = self.card.nid
+        try:
+            sibling_count = len(col.card_ids_of_note(note_id))
+        except Exception:
+            sibling_count = 1
+
+        self._last_answer = None
+        try:
+            col.remove_cards_and_orphaned_notes([card_id])
+        except Exception:
+            tooltip("删除卡片失败。")
+            return False
+
+        if sibling_count > 1:
+            tooltip("已删除当前卡片（同笔记其他卡片保留）")
+        else:
+            tooltip("已删除当前卡片（该笔记无其他卡片，笔记已一并删除）")
+
+        if mw.state == "deckBrowser" and getattr(mw, "deckBrowser", None):
+            try:
+                mw.deckBrowser.refresh()
+            except Exception:
+                pass
+        update = getattr(mw, "update_undo_actions", None)
+        if callable(update):
+            update()
+
+        return self.load_next()
+
     @staticmethod
     def _undo_step(col):
         try:

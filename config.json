@@ -11,6 +11,8 @@
     "hard": "2",
     "good": "3",
     "easy": "4",
+    "delete_card": "0",
+    "delete_card_2": "Escape",
     "reveal_1": "Space",
     "reveal_2": "Return",
     "reveal_grade": "good"
